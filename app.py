@@ -1,0 +1,786 @@
+"""Streamlit app for testing AWS GameLift FlexMatch matchmaking.
+
+Generic and reusable: no game-specific logic, no hardcoded configuration.
+"""
+
+import json
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+import boto3
+import streamlit as st
+from botocore.exceptions import BotoCoreError, ClientError
+
+
+# --------------------------------------------------------------------------- #
+# Constants
+# --------------------------------------------------------------------------- #
+
+STATUS_COLORS = {
+    "QUEUED": "#9e9e9e",
+    "SEARCHING": "#2196f3",
+    "PLACING": "#ffc107",
+    "COMPLETED": "#4caf50",
+    "FAILED": "#f44336",
+    "TIMED_OUT": "#ff9800",
+    "CANCELLED": "#9e9e9e",
+}
+
+TERMINAL_STATUSES = {"COMPLETED", "FAILED", "TIMED_OUT", "CANCELLED"}
+
+ATTRIBUTE_TYPE_TO_AWS = {
+    "number": "N",
+    "string": "S",
+    "string_list": "SL",
+    "string_number_map": "SDM",
+}
+
+
+# --------------------------------------------------------------------------- #
+# Session state init
+# --------------------------------------------------------------------------- #
+
+def init_session_state() -> None:
+    defaults = {
+        "aws_config": {"profile": "", "region": "eu-west-1", "config_name": ""},
+        "ruleset": None,
+        "matchmaking_config": None,
+        "active_tickets": [],
+        "latency_rows": [],
+        "ticket_details": {},
+        "load_status": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+# --------------------------------------------------------------------------- #
+# AWS helpers
+# --------------------------------------------------------------------------- #
+
+def get_gamelift_client(profile: str, region: str):
+    session = boto3.Session(profile_name=profile or None, region_name=region or None)
+    return session.client("gamelift")
+
+
+def load_configuration(profile: str, region: str, config_name: str) -> tuple[dict, dict]:
+    client = get_gamelift_client(profile, region)
+
+    config_response = client.describe_matchmaking_configurations(Names=[config_name])
+    configs = config_response.get("Configurations", [])
+    if not configs:
+        raise ValueError(f"Matchmaking configuration '{config_name}' not found")
+    config = configs[0]
+
+    rule_set_name = config.get("RuleSetName")
+    if not rule_set_name:
+        raise ValueError("Configuration has no RuleSetName")
+
+    rule_set_response = client.describe_matchmaking_rule_sets(Names=[rule_set_name])
+    rule_sets = rule_set_response.get("RuleSets", [])
+    if not rule_sets:
+        raise ValueError(f"Rule set '{rule_set_name}' not found")
+
+    rule_set_body = rule_sets[0].get("RuleSetBody", "{}")
+    ruleset = json.loads(rule_set_body)
+    return config, ruleset
+
+
+def describe_tickets(profile: str, region: str, ticket_ids: list[str]) -> list[dict]:
+    """Describe tickets in chunks of 10 (AWS limit)."""
+    if not ticket_ids:
+        return []
+    client = get_gamelift_client(profile, region)
+    results: list[dict] = []
+    for i in range(0, len(ticket_ids), 10):
+        chunk = ticket_ids[i : i + 10]
+        response = client.describe_matchmaking(TicketIds=chunk)
+        results.extend(response.get("TicketList", []))
+    return results
+
+
+def stop_ticket(profile: str, region: str, ticket_id: str) -> None:
+    client = get_gamelift_client(profile, region)
+    client.stop_matchmaking(TicketId=ticket_id)
+
+
+def start_ticket(
+    profile: str,
+    region: str,
+    config_name: str,
+    players: list[dict],
+) -> str:
+    client = get_gamelift_client(profile, region)
+    response = client.start_matchmaking(
+        ConfigurationName=config_name,
+        Players=players,
+    )
+    return response["MatchmakingTicket"]["TicketId"]
+
+
+# --------------------------------------------------------------------------- #
+# Ruleset helpers
+# --------------------------------------------------------------------------- #
+
+def get_player_attributes(ruleset: dict) -> list[dict]:
+    return ruleset.get("playerAttributes", []) or []
+
+
+def build_player_attribute_payload(
+    attr_def: dict, raw_value: Any
+) -> dict | None:
+    """Convert a form value into the AWS PlayerAttributes payload entry."""
+    attr_type = attr_def.get("type", "")
+    aws_type = ATTRIBUTE_TYPE_TO_AWS.get(attr_type)
+    if aws_type is None:
+        return None
+
+    if attr_type == "number":
+        if raw_value is None or raw_value == "":
+            return None
+        value_attr = {"N": float(raw_value)}
+    elif attr_type == "string":
+        if raw_value is None or raw_value == "":
+            return None
+        value_attr = {"S": str(raw_value)}
+    elif attr_type == "string_list":
+        if not raw_value:
+            return None
+        items = [item.strip() for item in str(raw_value).split(",") if item.strip()]
+        if not items:
+            return None
+        value_attr = {"SL": items}
+    elif attr_type == "string_number_map":
+        if not raw_value:
+            return None
+        parsed = json.loads(raw_value)
+        if not isinstance(parsed, dict):
+            raise ValueError("string_number_map must be a JSON object")
+        value_attr = {"SDM": {str(k): float(v) for k, v in parsed.items()}}
+    else:
+        return None
+
+    return {"AttributeType": aws_type, "ValueAttribute": value_attr}
+
+
+# --------------------------------------------------------------------------- #
+# UI components
+# --------------------------------------------------------------------------- #
+
+def render_sidebar() -> None:
+    st.sidebar.header("AWS Configuration")
+
+    aws_config = st.session_state["aws_config"]
+    profile = st.sidebar.text_input("AWS Profile Name", value=aws_config["profile"])
+    region = st.sidebar.text_input("AWS Region", value=aws_config["region"] or "eu-west-1")
+    config_name = st.sidebar.text_input(
+        "Matchmaking Configuration Name", value=aws_config["config_name"]
+    )
+
+    st.session_state["aws_config"] = {
+        "profile": profile.strip(),
+        "region": region.strip(),
+        "config_name": config_name.strip(),
+    }
+
+    if st.sidebar.button("Load Configuration", use_container_width=True):
+        if not config_name.strip():
+            st.session_state["load_status"] = ("error", "Configuration name is required")
+        else:
+            try:
+                config, ruleset = load_configuration(
+                    profile.strip(), region.strip(), config_name.strip()
+                )
+                st.session_state["matchmaking_config"] = config
+                st.session_state["ruleset"] = ruleset
+                st.session_state["load_status"] = (
+                    "success",
+                    f"Loaded '{config_name}' (rule set: {config.get('RuleSetName')})",
+                )
+            except (ClientError, BotoCoreError, ValueError, json.JSONDecodeError) as exc:
+                st.session_state["matchmaking_config"] = None
+                st.session_state["ruleset"] = None
+                st.session_state["load_status"] = ("error", str(exc))
+
+    status = st.session_state.get("load_status")
+    if status is not None:
+        kind, message = status
+        if kind == "success":
+            st.sidebar.success(message)
+        else:
+            st.sidebar.error(message)
+
+
+def render_ruleset_inspector() -> None:
+    st.header("Ruleset Inspector")
+    ruleset = st.session_state.get("ruleset")
+    if not ruleset:
+        st.info("Load a configuration from the sidebar to inspect its ruleset.")
+        return
+
+    # Algorithm
+    st.subheader("Algorithm")
+    algorithm = ruleset.get("algorithm", {}) or {}
+    algo_rows = [
+        {"Field": "strategy", "Value": algorithm.get("strategy", "")},
+        {"Field": "expansionAgeSelection", "Value": algorithm.get("expansionAgeSelection", "")},
+        {"Field": "batchingPreference", "Value": algorithm.get("batchingPreference", "")},
+    ]
+    st.table(algo_rows)
+
+    # Teams
+    st.subheader("Teams")
+    teams = ruleset.get("teams", []) or []
+    if teams:
+        st.table(
+            [
+                {
+                    "name": team.get("name", ""),
+                    "minPlayers": team.get("minPlayers", ""),
+                    "maxPlayers": team.get("maxPlayers", ""),
+                }
+                for team in teams
+            ]
+        )
+    else:
+        st.caption("No teams defined.")
+
+    # Player attributes
+    st.subheader("Player Attributes")
+    attributes = get_player_attributes(ruleset)
+    if attributes:
+        st.table(
+            [
+                {
+                    "name": attr.get("name", ""),
+                    "type": attr.get("type", ""),
+                    "default": _format_default(attr.get("default")),
+                }
+                for attr in attributes
+            ]
+        )
+    else:
+        st.caption("No player attributes defined.")
+
+    # Rules
+    st.subheader("Rules")
+    rules = ruleset.get("rules", []) or []
+    if rules:
+        st.table([_summarize_rule(rule) for rule in rules])
+    else:
+        st.caption("No rules defined.")
+
+    # Expansions
+    st.subheader("Expansions")
+    expansions = ruleset.get("expansions", []) or []
+    if expansions:
+        expansion_rows = []
+        for expansion in expansions:
+            steps = expansion.get("steps", []) or []
+            steps_str = ", ".join(
+                f"{step.get('waitTimeSeconds', '?')}s -> {step.get('value', '')}"
+                for step in steps
+            )
+            expansion_rows.append(
+                {"target": expansion.get("target", ""), "steps": steps_str}
+            )
+        st.table(expansion_rows)
+    else:
+        st.caption("No expansions defined.")
+
+
+def _format_default(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    return str(value)
+
+
+def _summarize_rule(rule: dict) -> dict:
+    rule_type = rule.get("type", "")
+    summary = {
+        "name": rule.get("name", ""),
+        "type": rule_type,
+        "description": rule.get("description", ""),
+    }
+
+    if rule_type == "batchDistance":
+        properties = (
+            f"batchAttribute={rule.get('batchAttribute', '')}, "
+            f"maxDistance={rule.get('maxDistance', '')}, "
+            f"partyAggregation={rule.get('partyAggregation', '')}"
+        )
+    elif rule_type == "comparison":
+        properties = (
+            f"measurements={rule.get('measurements', [])}, "
+            f"operation={rule.get('operation', '')}, "
+            f"referenceValue={rule.get('referenceValue', '')}"
+        )
+    elif rule_type == "distance":
+        properties = (
+            f"measurements={rule.get('measurements', [])}, "
+            f"referenceValue={rule.get('referenceValue', '')}, "
+            f"maxDistance={rule.get('maxDistance', '')}"
+        )
+    elif rule_type == "collection":
+        extras = []
+        if "minCount" in rule:
+            extras.append(f"minCount={rule.get('minCount')}")
+        if "maxCount" in rule:
+            extras.append(f"maxCount={rule.get('maxCount')}")
+        properties = (
+            f"measurements={rule.get('measurements', [])}, "
+            f"operation={rule.get('operation', '')}"
+        )
+        if extras:
+            properties += ", " + ", ".join(extras)
+    elif rule_type == "latency":
+        properties = f"maxLatency={rule.get('maxLatency', '')}"
+    elif rule_type == "compound":
+        properties = f"statement={rule.get('statement', '')}"
+    else:
+        properties = ""
+
+    summary["properties"] = properties
+    return summary
+
+
+def render_start_tickets() -> None:
+    st.header("Start Tickets")
+    ruleset = st.session_state.get("ruleset")
+    aws_config = st.session_state["aws_config"]
+
+    if not ruleset:
+        st.warning("Load a configuration first")
+        return
+
+    num_players = st.number_input(
+        "Number of players/tickets to start",
+        min_value=1,
+        max_value=200,
+        value=1,
+        step=1,
+    )
+
+    st.subheader("Player Attributes")
+    attribute_defs = get_player_attributes(ruleset)
+    attribute_values: dict[str, Any] = {}
+
+    if not attribute_defs:
+        st.caption("No player attributes declared in the ruleset.")
+    else:
+        for attr in attribute_defs:
+            attr_name = attr.get("name", "")
+            attr_type = attr.get("type", "")
+            default = attr.get("default")
+            label = f"{attr_name} ({attr_type})"
+            key = f"attr_{attr_name}"
+
+            if attr_type == "number":
+                default_value = float(default) if default is not None else 0.0
+                attribute_values[attr_name] = st.number_input(
+                    label, value=default_value, key=key, format="%.4f"
+                )
+            elif attr_type == "string":
+                default_value = str(default) if default is not None else ""
+                attribute_values[attr_name] = st.text_input(
+                    label, value=default_value, key=key
+                )
+            elif attr_type == "string_list":
+                if isinstance(default, list):
+                    default_value = ", ".join(str(item) for item in default)
+                else:
+                    default_value = ""
+                attribute_values[attr_name] = st.text_input(
+                    f"{label} — comma-separated",
+                    value=default_value,
+                    key=key,
+                )
+            elif attr_type == "string_number_map":
+                if isinstance(default, dict):
+                    default_value = json.dumps(default, indent=2)
+                else:
+                    default_value = "{}"
+                attribute_values[attr_name] = st.text_area(
+                    f"{label} — JSON object",
+                    value=default_value,
+                    key=key,
+                    height=100,
+                )
+            else:
+                st.caption(f"Unsupported attribute type: {attr_type} ({attr_name})")
+
+    st.subheader("Latency")
+    _render_latency_editor()
+
+    if st.button("Start Matchmaking", type="primary"):
+        _start_matchmaking_batch(
+            num_players=int(num_players),
+            attribute_defs=attribute_defs,
+            attribute_values=attribute_values,
+            aws_config=aws_config,
+        )
+
+    active_tickets = st.session_state.get("active_tickets", [])
+    if active_tickets:
+        st.subheader("Recently created tickets")
+        for ticket_id in active_tickets:
+            col1, col2 = st.columns([4, 1])
+            col1.code(ticket_id, language=None)
+            col2.button("Copy", key=f"copy_{ticket_id}", on_click=_copy_to_clipboard_noop)
+
+
+def _copy_to_clipboard_noop() -> None:
+    # Streamlit doesn't provide clipboard access; st.code already offers a copy icon on hover.
+    pass
+
+
+def _render_latency_editor() -> None:
+    rows: list[dict] = st.session_state["latency_rows"]
+
+    to_remove: list[int] = []
+    for index, row in enumerate(rows):
+        col_region, col_ms, col_del = st.columns([3, 2, 1])
+        row["region"] = col_region.text_input(
+            "Region",
+            value=row.get("region", ""),
+            key=f"latency_region_{index}",
+            label_visibility="collapsed",
+            placeholder="eu-west-1",
+        )
+        row["ms"] = col_ms.number_input(
+            "Latency (ms)",
+            value=int(row.get("ms", 50)),
+            min_value=0,
+            max_value=5000,
+            step=1,
+            key=f"latency_ms_{index}",
+            label_visibility="collapsed",
+        )
+        if col_del.button("Remove", key=f"latency_del_{index}"):
+            to_remove.append(index)
+
+    for index in sorted(to_remove, reverse=True):
+        rows.pop(index)
+
+    if st.button("Add latency row"):
+        rows.append({"region": "", "ms": 50})
+        st.rerun()
+
+
+def _start_matchmaking_batch(
+    num_players: int,
+    attribute_defs: list[dict],
+    attribute_values: dict[str, Any],
+    aws_config: dict,
+) -> None:
+    profile = aws_config["profile"]
+    region = aws_config["region"]
+    config_name = aws_config["config_name"]
+
+    if not config_name:
+        st.error("Configuration name is required")
+        return
+
+    # Build PlayerAttributes payload once (same for all players)
+    try:
+        player_attributes_payload: dict[str, dict] = {}
+        for attr_def in attribute_defs:
+            attr_name = attr_def.get("name", "")
+            raw_value = attribute_values.get(attr_name)
+            entry = build_player_attribute_payload(attr_def, raw_value)
+            if entry is not None:
+                player_attributes_payload[attr_name] = entry
+    except (ValueError, json.JSONDecodeError) as exc:
+        st.error(f"Invalid attribute value: {exc}")
+        return
+
+    latency_map: dict[str, int] = {}
+    for row in st.session_state["latency_rows"]:
+        region_name = (row.get("region") or "").strip()
+        if region_name:
+            latency_map[region_name] = int(row.get("ms", 0))
+
+    created: list[str] = []
+    failed: list[str] = []
+
+    progress = st.progress(0.0, text="Starting tickets...")
+    for i in range(num_players):
+        short_uuid = uuid.uuid4().hex[:8]
+        player_id = f"test-player-{i + 1}-{short_uuid}"
+        player_entry: dict[str, Any] = {
+            "PlayerId": player_id,
+            "PlayerAttributes": player_attributes_payload,
+        }
+        if latency_map:
+            player_entry["LatencyInMs"] = latency_map
+
+        try:
+            ticket_id = start_ticket(profile, region, config_name, [player_entry])
+            created.append(ticket_id)
+        except (ClientError, BotoCoreError) as exc:
+            failed.append(f"{player_id}: {exc}")
+
+        progress.progress((i + 1) / num_players, text=f"Started {i + 1}/{num_players}")
+
+    progress.empty()
+
+    if created:
+        st.session_state["active_tickets"].extend(created)
+        st.success(f"Created {len(created)} ticket(s)")
+    if failed:
+        st.error("Failed to start some tickets:\n" + "\n".join(failed))
+
+
+def render_monitor_tickets() -> None:
+    st.header("Monitor Tickets")
+    aws_config = st.session_state["aws_config"]
+
+    top_col1, top_col2, top_col3 = st.columns([2, 2, 2])
+    auto_refresh = top_col1.checkbox("Auto-refresh", value=False, key="auto_refresh")
+    refresh_interval = top_col2.number_input(
+        "Interval (s)", min_value=2, max_value=300, value=10, step=1, key="refresh_interval"
+    )
+    refresh_now = top_col3.button("Refresh Now")
+
+    add_col1, add_col2 = st.columns([4, 1])
+    manual_ticket = add_col1.text_input(
+        "Add existing ticket ID", key="manual_ticket_input", placeholder="ticket-id..."
+    )
+    if add_col2.button("Add"):
+        ticket_id = manual_ticket.strip()
+        if ticket_id and ticket_id not in st.session_state["active_tickets"]:
+            st.session_state["active_tickets"].append(ticket_id)
+            st.rerun()
+
+    action_col1, action_col2 = st.columns(2)
+    if action_col1.button("Stop All Tickets"):
+        _stop_all_active_tickets(aws_config)
+    if action_col2.button("Clear Terminal Tickets"):
+        _clear_terminal_tickets()
+
+    ticket_ids = list(st.session_state["active_tickets"])
+    if not ticket_ids:
+        st.info("No tickets to monitor. Start tickets in the previous tab or add an ID above.")
+        return
+
+    if refresh_now or auto_refresh or not st.session_state["ticket_details"]:
+        try:
+            tickets = describe_tickets(
+                aws_config["profile"], aws_config["region"], ticket_ids
+            )
+            st.session_state["ticket_details"] = {
+                ticket["TicketId"]: ticket for ticket in tickets
+            }
+        except (ClientError, BotoCoreError) as exc:
+            st.error(f"Failed to describe tickets: {exc}")
+
+    for ticket_id in ticket_ids:
+        ticket = st.session_state["ticket_details"].get(ticket_id)
+        _render_ticket_card(ticket_id, ticket)
+
+    if auto_refresh:
+        time.sleep(int(refresh_interval))
+        st.rerun()
+
+
+def _render_ticket_card(ticket_id: str, ticket: dict | None) -> None:
+    with st.container(border=True):
+        header_col1, header_col2 = st.columns([3, 1])
+        header_col1.markdown(f"**Ticket:** `{ticket_id}`")
+
+        if ticket is None:
+            header_col2.markdown(_status_badge("UNKNOWN"), unsafe_allow_html=True)
+            st.caption("No details yet — refresh to fetch.")
+            return
+
+        status = ticket.get("Status", "UNKNOWN")
+        header_col2.markdown(_status_badge(status), unsafe_allow_html=True)
+
+        start_time = ticket.get("StartTime")
+        if start_time is not None:
+            elapsed = _elapsed_seconds(start_time)
+            st.caption(
+                f"StartTime: {start_time.isoformat() if hasattr(start_time, 'isoformat') else start_time}"
+                f" — elapsed: {elapsed:.0f}s"
+            )
+
+        estimated_wait = ticket.get("EstimatedWaitTime")
+        if estimated_wait is not None:
+            st.caption(f"EstimatedWaitTime: {estimated_wait}s")
+
+        status_reason = ticket.get("StatusReason")
+        status_message = ticket.get("StatusMessage")
+        if status_reason:
+            st.markdown(
+                f"<div style='background:#ffebee;border-left:4px solid #f44336;"
+                f"padding:8px 12px;border-radius:4px;margin:4px 0;'>"
+                f"<b>StatusReason:</b> {status_reason}</div>",
+                unsafe_allow_html=True,
+            )
+        if status_message:
+            st.markdown(
+                f"<div style='background:#fff3e0;border-left:4px solid #ff9800;"
+                f"padding:8px 12px;border-radius:4px;margin:4px 0;'>"
+                f"<b>StatusMessage:</b> {status_message}</div>",
+                unsafe_allow_html=True,
+            )
+
+        players = ticket.get("Players", []) or []
+        if players:
+            with st.expander(f"Players ({len(players)})", expanded=False):
+                for player in players:
+                    st.markdown(f"**PlayerId:** `{player.get('PlayerId', '')}`")
+                    team = player.get("Team")
+                    if team:
+                        st.markdown(f"Team: `{team}`")
+                    attributes = player.get("PlayerAttributes", {}) or {}
+                    if attributes:
+                        st.markdown("PlayerAttributes:")
+                        st.json(_render_player_attributes(attributes))
+                    latency = player.get("LatencyInMs") or {}
+                    if latency:
+                        st.markdown("LatencyInMs:")
+                        st.json(latency)
+                    st.divider()
+
+        if status == "COMPLETED":
+            game_session = ticket.get("GameSessionConnectionInfo", {}) or {}
+            arn = game_session.get("GameSessionArn", "")
+            ip = game_session.get("IpAddress", "")
+            port = game_session.get("Port", "")
+            dns = game_session.get("DnsName", "")
+            st.markdown("**Game Session**")
+            st.code(
+                json.dumps(
+                    {
+                        "GameSessionArn": arn,
+                        "IpAddress": ip,
+                        "DnsName": dns,
+                        "Port": port,
+                    },
+                    indent=2,
+                ),
+                language="json",
+            )
+            matched = game_session.get("MatchedPlayerSessions", []) or []
+            if matched:
+                st.markdown("**MatchedPlayerSessions**")
+                st.table(
+                    [
+                        {
+                            "PlayerId": m.get("PlayerId", ""),
+                            "PlayerSessionId": m.get("PlayerSessionId", ""),
+                        }
+                        for m in matched
+                    ]
+                )
+            # Team assignments are on the players themselves
+            team_map = [
+                {"PlayerId": p.get("PlayerId", ""), "Team": p.get("Team", "")}
+                for p in players
+            ]
+            if team_map:
+                st.markdown("**Team assignments**")
+                st.table(team_map)
+
+
+def _render_player_attributes(attributes: dict) -> dict:
+    """Flatten AWS PlayerAttributes into a readable dict."""
+    flat: dict[str, Any] = {}
+    for name, entry in attributes.items():
+        value_attr = entry.get("ValueAttribute", {}) or {}
+        # Pick whichever type key is present
+        for type_key in ("N", "S", "SL", "SDM"):
+            if type_key in value_attr:
+                flat[name] = value_attr[type_key]
+                break
+        else:
+            flat[name] = value_attr
+    return flat
+
+
+def _status_badge(status: str) -> str:
+    color = STATUS_COLORS.get(status, "#607d8b")
+    return (
+        f"<span style='background:{color};color:white;padding:4px 10px;"
+        f"border-radius:12px;font-weight:600;font-size:0.85em;'>{status}</span>"
+    )
+
+
+def _elapsed_seconds(start_time: Any) -> float:
+    if isinstance(start_time, datetime):
+        start = start_time
+    else:
+        try:
+            start = datetime.fromisoformat(str(start_time))
+        except ValueError:
+            return 0.0
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - start).total_seconds()
+
+
+def _stop_all_active_tickets(aws_config: dict) -> None:
+    stopped = 0
+    errors: list[str] = []
+    for ticket_id in list(st.session_state["active_tickets"]):
+        ticket = st.session_state["ticket_details"].get(ticket_id)
+        status = ticket.get("Status") if ticket else None
+        if status in TERMINAL_STATUSES:
+            continue
+        try:
+            stop_ticket(aws_config["profile"], aws_config["region"], ticket_id)
+            stopped += 1
+        except (ClientError, BotoCoreError) as exc:
+            errors.append(f"{ticket_id}: {exc}")
+
+    if stopped:
+        st.success(f"Stopped {stopped} ticket(s)")
+    if errors:
+        st.error("Some tickets failed to stop:\n" + "\n".join(errors))
+
+
+def _clear_terminal_tickets() -> None:
+    details = st.session_state["ticket_details"]
+    remaining: list[str] = []
+    for ticket_id in st.session_state["active_tickets"]:
+        ticket = details.get(ticket_id)
+        status = ticket.get("Status") if ticket else None
+        if status in TERMINAL_STATUSES:
+            details.pop(ticket_id, None)
+            continue
+        remaining.append(ticket_id)
+    st.session_state["active_tickets"] = remaining
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+
+def main() -> None:
+    st.set_page_config(page_title="FlexMatch Tool", layout="wide")
+    init_session_state()
+
+    st.title("AWS GameLift FlexMatch Tool")
+
+    render_sidebar()
+
+    tab_inspector, tab_start, tab_monitor = st.tabs(
+        ["Ruleset Inspector", "Start Tickets", "Monitor Tickets"]
+    )
+
+    with tab_inspector:
+        render_ruleset_inspector()
+    with tab_start:
+        render_start_tickets()
+    with tab_monitor:
+        render_monitor_tickets()
+
+
+if __name__ == "__main__":
+    main()
