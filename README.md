@@ -1,108 +1,111 @@
 # FlexMatch Tool
 
-Strumento Streamlit per testare il matchmaking AWS GameLift FlexMatch. Generico e riutilizzabile: nessun dato specifico di gioco è hardcoded — profilo AWS, regione e nome della matchmaking configuration sono inseriti a runtime dalla sidebar.
+Streamlit tool for testing AWS GameLift FlexMatch matchmaking. Generic and reusable: no game-specific data is hardcoded — AWS profile, region and matchmaking configuration name are entered at runtime from the sidebar.
 
-## Requisiti
+## Requirements
 
-- Python 3.10+ (testato con 3.14)
-- Un profilo AWS configurato con permessi per GameLift (`gamelift:DescribeMatchmakingConfigurations`, `gamelift:DescribeMatchmakingRuleSets`, `gamelift:StartMatchmaking`, `gamelift:DescribeMatchmaking`, `gamelift:StopMatchmaking`)
-- AWS credentials accessibili a boto3 (file `~/.aws/credentials` + `~/.aws/config`, oppure SSO login già fatto)
+- Python 3.10+ (tested with 3.14)
+- An AWS profile with GameLift permissions (`gamelift:DescribeMatchmakingConfigurations`, `gamelift:DescribeMatchmakingRuleSets`, `gamelift:StartMatchmaking`, `gamelift:DescribeMatchmaking`, `gamelift:StopMatchmaking`)
+- AWS credentials reachable by boto3 (`~/.aws/credentials` + `~/.aws/config`, or an active SSO session)
 
 ## Setup
 
-1. **Clona / entra nella cartella del progetto**
+1. **Clone / enter the project folder**
    ```bash
    cd c:\Users\Nicola\Desktop\FlexMatchTool
    ```
 
-2. **(Consigliato) Crea un virtual environment**
+2. **(Recommended) Create a virtual environment**
    ```bash
    python -m venv .venv
    .venv\Scripts\activate
    ```
 
-3. **Installa le dipendenze**
+3. **Install dependencies**
    ```bash
    python -m pip install -r requirements.txt
    ```
 
-## Avvio
+## Run
 
-Dalla cartella del progetto:
+From the project folder:
 
 ```bash
 python -m streamlit run app.py
 ```
 
-Streamlit aprirà automaticamente il browser su `http://localhost:8501`.
+Streamlit will open the browser automatically at `http://localhost:8501`.
 
-> **Nota:** usare `python -m streamlit` evita problemi di PATH quando l'eseguibile `streamlit` è installato nella user site-packages. In alternativa, aggiungere a PATH la cartella `Scripts` della tua installazione Python (es. `C:\Users\<user>\AppData\Roaming\Python\Python314\Scripts`) e poi usare direttamente `streamlit run app.py`.
+> **Note:** using `python -m streamlit` avoids PATH issues when the `streamlit` executable is installed in user site-packages. Alternatively, add Python's `Scripts` folder to PATH (e.g. `C:\Users\<user>\AppData\Roaming\Python\Python314\Scripts`) and use `streamlit run app.py` directly.
 
-## Configurazione AWS
+## AWS configuration
 
-Il tool usa `boto3.Session(profile_name=...)`, quindi qualsiasi profilo presente in `~/.aws/credentials` o `~/.aws/config` è utilizzabile.
+The tool uses `boto3.Session(profile_name=...)`, so any profile listed in `~/.aws/credentials` or `~/.aws/config` works.
 
-Esempio `~/.aws/credentials`:
+Example `~/.aws/credentials`:
 ```ini
-[mio-profilo]
+[my-profile]
 aws_access_key_id = AKIA...
 aws_secret_access_key = ...
 ```
 
-Per SSO:
+For SSO:
 ```bash
-aws sso login --profile mio-profilo
+aws sso login --profile my-profile
 ```
 
-## Utilizzo
+## Usage
 
 ### 1. Sidebar — AWS Config
-- **AWS Profile Name**: nome del profilo (vuoto = default)
-- **AWS Region**: regione in cui si trova la matchmaking configuration (es. `eu-west-1`)
-- **Matchmaking Configuration Name**: nome esatto della configuration su GameLift
-- Premi **Load Configuration**: il tool scarica la configuration e il ruleset associato
+- **AWS Profile Name**: profile name (empty = default)
+- **AWS Region**: region where the matchmaking configuration lives (e.g. `eu-west-1`)
+- **Matchmaking Configuration Name**: exact name of the GameLift matchmaking configuration
+- Click **Load Configuration**: the tool fetches the configuration and its rule set
 
 ### 2. Tab "Ruleset Inspector"
-Mostra in modo strutturato il ruleset caricato: algoritmo, team, player attributes, regole (con proprietà specifiche per tipo: `batchDistance`, `comparison`, `distance`, `collection`, `latency`, `compound`) ed expansions.
+Displays the loaded rule set in a structured way: algorithm, teams, player attributes, rules (with type-specific properties for `batchDistance`, `comparison`, `distance`, `collection`, `latency`, `compound`) and expansions.
 
 ### 3. Tab "Start Tickets"
-Il tab è organizzato per **ticket**: ogni ticket è una richiesta di matchmaking separata e può contenere uno o più player. Più player nello stesso ticket vengono trattati da FlexMatch come una **party**.
+Organized by **ticket**: each ticket is a separate matchmaking request and can hold one or more players. Multiple players inside the same ticket are treated by FlexMatch as a **party**.
 
-- Ogni ticket mostra la lista dei suoi player; per ogni player puoi:
-  - Impostare un **Player ID** custom (oppure lasciarlo vuoto per generarne uno automatico, formato `test-player-<ticket>-<player>-<uuid>`)
-  - Compilare gli **attributi** dichiarati nel ruleset (form dinamico: numeri, stringhe, liste, mappe string→number)
-  - Aggiungere coppie **regione/latenza** dedicate a quel player
-  - Rimuovere il player (se il ticket ne contiene più di uno)
-- **Add player to this ticket**: aggiunge un compagno di party allo stesso ticket
-- **Add empty ticket**: aggiunge un nuovo ticket con un solo player default
-- **Bulk quantity + Add N solo tickets**: scorciatoia per creare rapidamente N ticket "solo" con valori di default (tipico per stress test)
-- **Reset drafts**: svuota i draft e ricrea un ticket default
-- **Start Matchmaking**: esegue una `start_matchmaking` per ogni ticket con tutti i suoi player e salva i ticket ID in sessione
+- Each ticket shows its player list; per player you can:
+  - Set a custom **Player ID** (or leave it blank to auto-generate `test-player-<ticket>-<player>-<uuid>`)
+  - Fill in the **attributes** declared in the rule set (dynamic form: numbers, strings, lists, string→number maps). Labels show `— required` when the rule set declares no default, or `— default: X` otherwise
+  - Add dedicated **region/latency** pairs for that player
+  - Remove the player (when the ticket holds more than one)
+- **Add player to this ticket**: adds a party-mate to the same ticket
+- **Add empty ticket**: appends a new ticket with a single default player
+- **Bulk quantity + Add N solo tickets**: quickly create N solo tickets with default values (typical for stress tests)
+- **Reset drafts**: clears drafts and restores one default ticket
+- **Start Matchmaking**: issues one `start_matchmaking` call per ticket with all its players, validates required attributes client-side first, and stores the returned ticket IDs in session
 
 ### 4. Tab "Monitor Tickets"
-- Mostra stato di tutti i ticket attivi con badge colorato
-- Visualizza `StatusReason` / `StatusMessage` evidenziati in caso di errore
-- Per ticket `COMPLETED`: mostra GameSession ARN, IP, porta, e assegnazioni di team
-- **Auto-refresh** configurabile, oppure refresh manuale
-- Possibile aggiungere manualmente ticket ID esistenti
-- **Stop All Tickets**: annulla tutti i ticket non terminati
-- **Clear Terminal Tickets**: rimuove dalla lista i ticket già conclusi
+- Shows the status of every active ticket with a colored badge
+- Highlights `StatusReason` / `StatusMessage` when matching fails
+- For `COMPLETED` tickets: shows GameSession ARN, IP, port and team assignments
+- Configurable **auto-refresh** plus manual refresh
+- Manual ticket ID input to track externally-created tickets
+- **Stop All Tickets**: cancels every non-terminal ticket
+- **Clear Terminal Tickets**: removes finished tickets from the list
 
 ## Troubleshooting
 
 **`streamlit : The term 'streamlit' is not recognized...`**
-Usa `python -m streamlit run app.py` oppure aggiungi la cartella `Scripts` di Python al PATH.
+Use `python -m streamlit run app.py` or add Python's `Scripts` folder to PATH.
 
 **`NoCredentialsError` / `ProfileNotFound`**
-Verifica che il profilo esista in `~/.aws/credentials` o che `aws sso login --profile <nome>` sia stato eseguito.
+Check the profile exists in `~/.aws/credentials` or run `aws sso login --profile <name>`.
 
-**`ResourceNotFoundException` sul load**
-Controlla che il nome della matchmaking configuration sia esatto e che la regione sia quella giusta (le configurations sono per-region).
+**`ResourceNotFoundException` on load**
+Verify the matchmaking configuration name is correct and the region matches (configurations are per-region).
 
-**Ticket bloccato in `SEARCHING` senza match**
-Controlla `StatusReason` e `StatusMessage` nel tab Monitor: indicano quale regola ha fallito. Spesso servono più ticket in parallelo per soddisfare i `minPlayers` del team.
+**`Invalid player; missing required attribute ...`**
+The rule set requires an attribute with no default; fill it in the Start Tickets form (labels marked `— required`).
 
-## File
+**Ticket stuck in `SEARCHING` with no match**
+Check `StatusReason` / `StatusMessage` in the Monitor tab — they tell you which rule failed. Often you need more concurrent tickets to meet the team's `minPlayers`.
 
-- `app.py` — applicazione Streamlit (singolo file)
-- `requirements.txt` — dipendenze Python
+## Files
+
+- `app.py` — Streamlit application (single file)
+- `requirements.txt` — Python dependencies

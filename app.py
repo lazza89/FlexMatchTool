@@ -135,17 +135,20 @@ def build_player_attribute_payload(
     """Convert a form value into the AWS PlayerAttributes payload entry.
 
     boto3 expects each attribute as {"N": ...} / {"S": ...} / {"SL": ...} / {"SDM": ...}.
+    Empty string / list / map values are omitted because boto3 rejects them
+    client-side (min length 1); numbers are always sent (0.0 is valid).
     """
     attr_type = attr_def.get("type", "")
 
     if attr_type == "number":
         if raw_value is None or raw_value == "":
-            return None
+            return {"N": 0.0}
         return {"N": float(raw_value)}
     if attr_type == "string":
-        if raw_value is None or raw_value == "":
+        text = "" if raw_value is None else str(raw_value)
+        if not text:
             return None
-        return {"S": str(raw_value)}
+        return {"S": text}
     if attr_type == "string_list":
         if not raw_value:
             return None
@@ -154,11 +157,14 @@ def build_player_attribute_payload(
             return None
         return {"SL": items}
     if attr_type == "string_number_map":
-        if not raw_value:
+        text = str(raw_value or "").strip()
+        if not text:
             return None
-        parsed = json.loads(raw_value)
+        parsed = json.loads(text)
         if not isinstance(parsed, dict):
             raise ValueError("string_number_map must be a JSON object")
+        if not parsed:
+            return None
         return {"SDM": {str(k): float(v) for k, v in parsed.items()}}
     return None
 
@@ -510,7 +516,7 @@ def _render_player_attributes_form(
         attr_type = attr_def.get("type", "")
         key = f"attr_{ticket['_uid']}_{player['_uid']}_{name}"
         current = player["attributes"].get(name, _form_default_for_attribute(attr_def))
-        label = f"{name} ({attr_type})"
+        label = _attribute_label(attr_def)
 
         if attr_type == "number":
             player["attributes"][name] = st.number_input(
@@ -528,6 +534,17 @@ def _render_player_attributes_form(
             )
         else:
             st.caption(f"Unsupported attribute type: {attr_type} ({name})")
+
+
+def _attribute_label(attr_def: dict) -> str:
+    name = attr_def.get("name", "")
+    attr_type = attr_def.get("type", "")
+    default = attr_def.get("default")
+    if default is None:
+        return f"{name} ({attr_type}) — required"
+    if isinstance(default, (dict, list)):
+        return f"{name} ({attr_type}) — default: {json.dumps(default)}"
+    return f"{name} ({attr_type}) — default: {default}"
 
 
 def _render_player_latency(ticket: dict, player: dict) -> None:
@@ -591,6 +608,14 @@ def _start_matchmaking_batch(
         st.error("No tickets to start")
         return
 
+    missing = _find_missing_required_attributes(ticket_drafts, attribute_defs)
+    if missing:
+        st.error(
+            "Fill all required attributes before starting:\n"
+            + "\n".join(f"- {m}" for m in missing)
+        )
+        return
+
     created: list[str] = []
     failed: list[str] = []
 
@@ -620,6 +645,27 @@ def _start_matchmaking_batch(
         st.success(f"Created {len(created)} ticket(s)")
     if failed:
         st.error("Failed to start some tickets:\n" + "\n".join(failed))
+
+
+def _find_missing_required_attributes(
+    ticket_drafts: list[dict], attribute_defs: list[dict]
+) -> list[str]:
+    """Return messages for required attributes (no default in ruleset) left empty."""
+    required = [a for a in attribute_defs if a.get("default") is None]
+    if not required:
+        return []
+
+    messages: list[str] = []
+    for t_idx, ticket in enumerate(ticket_drafts):
+        for p_idx, player in enumerate(ticket["players"]):
+            for attr_def in required:
+                name = attr_def.get("name", "")
+                value = player["attributes"].get(name)
+                if build_player_attribute_payload(attr_def, value) is None:
+                    messages.append(
+                        f"Ticket {t_idx + 1}, Player {p_idx + 1}: '{name}' is required"
+                    )
+    return messages
 
 
 def _build_ticket_players_payload(
