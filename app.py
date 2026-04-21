@@ -132,38 +132,35 @@ def get_player_attributes(ruleset: dict) -> list[dict]:
 def build_player_attribute_payload(
     attr_def: dict, raw_value: Any
 ) -> dict | None:
-    """Convert a form value into the AWS PlayerAttributes payload entry."""
+    """Convert a form value into the AWS PlayerAttributes payload entry.
+
+    boto3 expects each attribute as {"N": ...} / {"S": ...} / {"SL": ...} / {"SDM": ...}.
+    """
     attr_type = attr_def.get("type", "")
-    aws_type = ATTRIBUTE_TYPE_TO_AWS.get(attr_type)
-    if aws_type is None:
-        return None
 
     if attr_type == "number":
         if raw_value is None or raw_value == "":
             return None
-        value_attr = {"N": float(raw_value)}
-    elif attr_type == "string":
+        return {"N": float(raw_value)}
+    if attr_type == "string":
         if raw_value is None or raw_value == "":
             return None
-        value_attr = {"S": str(raw_value)}
-    elif attr_type == "string_list":
+        return {"S": str(raw_value)}
+    if attr_type == "string_list":
         if not raw_value:
             return None
         items = [item.strip() for item in str(raw_value).split(",") if item.strip()]
         if not items:
             return None
-        value_attr = {"SL": items}
-    elif attr_type == "string_number_map":
+        return {"SL": items}
+    if attr_type == "string_number_map":
         if not raw_value:
             return None
         parsed = json.loads(raw_value)
         if not isinstance(parsed, dict):
             raise ValueError("string_number_map must be a JSON object")
-        value_attr = {"SDM": {str(k): float(v) for k, v in parsed.items()}}
-    else:
-        return None
-
-    return {"AttributeType": aws_type, "ValueAttribute": value_attr}
+        return {"SDM": {str(k): float(v) for k, v in parsed.items()}}
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -814,17 +811,21 @@ def _render_ticket_card(ticket_id: str, ticket: dict | None) -> None:
 
 
 def _render_player_attributes(attributes: dict) -> dict:
-    """Flatten AWS PlayerAttributes into a readable dict."""
+    """Flatten AWS PlayerAttributes into a readable dict.
+
+    Each entry is {"N": ...} / {"S": ...} / {"SL": ...} / {"SDM": ...}.
+    """
     flat: dict[str, Any] = {}
     for name, entry in attributes.items():
-        value_attr = entry.get("ValueAttribute", {}) or {}
-        # Pick whichever type key is present
+        if not isinstance(entry, dict):
+            flat[name] = entry
+            continue
         for type_key in ("N", "S", "SL", "SDM"):
-            if type_key in value_attr:
-                flat[name] = value_attr[type_key]
+            if type_key in entry:
+                flat[name] = entry[type_key]
                 break
         else:
-            flat[name] = value_attr
+            flat[name] = entry
     return flat
 
 
