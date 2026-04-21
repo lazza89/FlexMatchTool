@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"c:/Users/Nicola/Desktop/FlexMatchTool\" remote -v)",
+      "Bash(gh auth *)",
+      "PowerShell(gh --version)",
+      "Bash(curl -s \"https://api.github.com/repos/lazza89/FlexMatchTool/issues?state=open\")"
+    ]
+  }
+}

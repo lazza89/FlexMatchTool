@@ -66,10 +66,18 @@ aws sso login --profile mio-profilo
 Mostra in modo strutturato il ruleset caricato: algoritmo, team, player attributes, regole (con proprietà specifiche per tipo: `batchDistance`, `comparison`, `distance`, `collection`, `latency`, `compound`) ed expansions.
 
 ### 3. Tab "Start Tickets"
-- Imposta quanti ticket/player creare
-- Compila i player attributes (il form è generato dinamicamente dal ruleset)
-- Aggiungi coppie regione/latenza se necessario
-- Premi **Start Matchmaking**: crea N ticket con `PlayerId` nel formato `test-player-<N>-<uuid>`
+Il tab è organizzato per **ticket**: ogni ticket è una richiesta di matchmaking separata e può contenere uno o più player. Più player nello stesso ticket vengono trattati da FlexMatch come una **party**.
+
+- Ogni ticket mostra la lista dei suoi player; per ogni player puoi:
+  - Impostare un **Player ID** custom (oppure lasciarlo vuoto per generarne uno automatico, formato `test-player-<ticket>-<player>-<uuid>`)
+  - Compilare gli **attributi** dichiarati nel ruleset (form dinamico: numeri, stringhe, liste, mappe string→number)
+  - Aggiungere coppie **regione/latenza** dedicate a quel player
+  - Rimuovere il player (se il ticket ne contiene più di uno)
+- **Add player to this ticket**: aggiunge un compagno di party allo stesso ticket
+- **Add empty ticket**: aggiunge un nuovo ticket con un solo player default
+- **Bulk quantity + Add N solo tickets**: scorciatoia per creare rapidamente N ticket "solo" con valori di default (tipico per stress test)
+- **Reset drafts**: svuota i draft e ricrea un ticket default
+- **Start Matchmaking**: esegue una `start_matchmaking` per ogni ticket con tutti i suoi player e salva i ticket ID in sessione
 
 ### 4. Tab "Monitor Tickets"
 - Mostra stato di tutti i ticket attivi con badge colorato

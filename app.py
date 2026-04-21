@@ -48,7 +48,7 @@ def init_session_state() -> None:
         "ruleset": None,
         "matchmaking_config": None,
         "active_tickets": [],
-        "latency_rows": [],
+        "ticket_drafts": [],
         "ticket_details": {},
         "load_status": None,
     }
@@ -358,124 +358,229 @@ def render_start_tickets() -> None:
         st.warning("Load a configuration first")
         return
 
-    num_players = st.number_input(
-        "Number of players/tickets to start",
+    attribute_defs = get_player_attributes(ruleset)
+    _ensure_ticket_drafts(ruleset)
+    ticket_drafts: list[dict] = st.session_state["ticket_drafts"]
+
+    st.caption(
+        "Each ticket is one matchmaking request. Multiple players inside the same "
+        "ticket are treated as a party by FlexMatch."
+    )
+
+    bulk_col1, bulk_col2, bulk_col3 = st.columns([2, 2, 2])
+    bulk_count = bulk_col1.number_input(
+        "Bulk quantity",
         min_value=1,
         max_value=200,
         value=1,
         step=1,
+        key="bulk_count",
     )
+    if bulk_col2.button("Add N solo tickets", help="One player per ticket, default values"):
+        for _ in range(int(bulk_count)):
+            ticket_drafts.append(_new_ticket_draft(ruleset, players=1))
+        st.rerun()
+    if bulk_col3.button("Reset drafts"):
+        ticket_drafts.clear()
+        ticket_drafts.append(_new_ticket_draft(ruleset, players=1))
+        st.rerun()
 
-    st.subheader("Player Attributes")
-    attribute_defs = get_player_attributes(ruleset)
-    attribute_values: dict[str, Any] = {}
+    st.divider()
 
-    if not attribute_defs:
-        st.caption("No player attributes declared in the ruleset.")
-    else:
-        for attr in attribute_defs:
-            attr_name = attr.get("name", "")
-            attr_type = attr.get("type", "")
-            default = attr.get("default")
-            label = f"{attr_name} ({attr_type})"
-            key = f"attr_{attr_name}"
+    to_remove_tickets: list[int] = []
+    for ticket_idx, ticket in enumerate(ticket_drafts):
+        with st.container(border=True):
+            header_col1, header_col2 = st.columns([5, 1])
+            header_col1.markdown(
+                f"### Ticket {ticket_idx + 1} — {len(ticket['players'])} player(s)"
+            )
+            if header_col2.button(
+                "Remove ticket", key=f"rm_ticket_{ticket['_uid']}"
+            ):
+                to_remove_tickets.append(ticket_idx)
 
-            if attr_type == "number":
-                default_value = float(default) if default is not None else 0.0
-                attribute_values[attr_name] = st.number_input(
-                    label, value=default_value, key=key, format="%.4f"
-                )
-            elif attr_type == "string":
-                default_value = str(default) if default is not None else ""
-                attribute_values[attr_name] = st.text_input(
-                    label, value=default_value, key=key
-                )
-            elif attr_type == "string_list":
-                if isinstance(default, list):
-                    default_value = ", ".join(str(item) for item in default)
-                else:
-                    default_value = ""
-                attribute_values[attr_name] = st.text_input(
-                    f"{label} — comma-separated",
-                    value=default_value,
-                    key=key,
-                )
-            elif attr_type == "string_number_map":
-                if isinstance(default, dict):
-                    default_value = json.dumps(default, indent=2)
-                else:
-                    default_value = "{}"
-                attribute_values[attr_name] = st.text_area(
-                    f"{label} — JSON object",
-                    value=default_value,
-                    key=key,
-                    height=100,
-                )
-            else:
-                st.caption(f"Unsupported attribute type: {attr_type} ({attr_name})")
+            _render_ticket_players(ticket, attribute_defs)
 
-    st.subheader("Latency")
-    _render_latency_editor()
+            if st.button("Add player to this ticket", key=f"add_player_{ticket['_uid']}"):
+                ticket["players"].append(_new_player_draft(ruleset))
+                st.rerun()
+
+    if to_remove_tickets:
+        for idx in sorted(to_remove_tickets, reverse=True):
+            ticket_drafts.pop(idx)
+        if not ticket_drafts:
+            ticket_drafts.append(_new_ticket_draft(ruleset, players=1))
+        st.rerun()
+
+    if st.button("Add empty ticket"):
+        ticket_drafts.append(_new_ticket_draft(ruleset, players=1))
+        st.rerun()
+
+    st.divider()
 
     if st.button("Start Matchmaking", type="primary"):
-        _start_matchmaking_batch(
-            num_players=int(num_players),
-            attribute_defs=attribute_defs,
-            attribute_values=attribute_values,
-            aws_config=aws_config,
-        )
+        _start_matchmaking_batch(ticket_drafts, attribute_defs, aws_config)
 
     active_tickets = st.session_state.get("active_tickets", [])
     if active_tickets:
         st.subheader("Recently created tickets")
         for ticket_id in active_tickets:
-            col1, col2 = st.columns([4, 1])
-            col1.code(ticket_id, language=None)
-            col2.button("Copy", key=f"copy_{ticket_id}", on_click=_copy_to_clipboard_noop)
+            st.code(ticket_id, language=None)
 
 
-def _copy_to_clipboard_noop() -> None:
-    # Streamlit doesn't provide clipboard access; st.code already offers a copy icon on hover.
-    pass
+def _ensure_ticket_drafts(ruleset: dict) -> None:
+    if not st.session_state.get("ticket_drafts"):
+        st.session_state["ticket_drafts"] = [_new_ticket_draft(ruleset, players=1)]
 
 
-def _render_latency_editor() -> None:
-    rows: list[dict] = st.session_state["latency_rows"]
+def _new_ticket_draft(ruleset: dict, players: int = 1) -> dict:
+    return {
+        "_uid": uuid.uuid4().hex,
+        "players": [_new_player_draft(ruleset) for _ in range(max(1, players))],
+    }
 
+
+def _new_player_draft(ruleset: dict) -> dict:
+    attributes: dict[str, Any] = {}
+    for attr_def in get_player_attributes(ruleset):
+        attributes[attr_def.get("name", "")] = _form_default_for_attribute(attr_def)
+    return {
+        "_uid": uuid.uuid4().hex,
+        "player_id": "",
+        "attributes": attributes,
+        "latency": [],
+    }
+
+
+def _form_default_for_attribute(attr_def: dict) -> Any:
+    attr_type = attr_def.get("type", "")
+    default = attr_def.get("default")
+    if attr_type == "number":
+        return float(default) if default is not None else 0.0
+    if attr_type == "string":
+        return str(default) if default is not None else ""
+    if attr_type == "string_list":
+        if isinstance(default, list):
+            return ", ".join(str(x) for x in default)
+        return ""
+    if attr_type == "string_number_map":
+        if isinstance(default, dict):
+            return json.dumps(default, indent=2)
+        return "{}"
+    return ""
+
+
+def _render_ticket_players(ticket: dict, attribute_defs: list[dict]) -> None:
     to_remove: list[int] = []
-    for index, row in enumerate(rows):
+    for player_idx, player in enumerate(ticket["players"]):
+        with st.container(border=True):
+            head_col1, head_col2, head_col3 = st.columns([2, 3, 1])
+            head_col1.markdown(f"**Player {player_idx + 1}**")
+            player["player_id"] = head_col2.text_input(
+                "Player ID (blank = auto)",
+                value=player.get("player_id", ""),
+                key=f"pid_{ticket['_uid']}_{player['_uid']}",
+                label_visibility="collapsed",
+                placeholder="Player ID (blank = auto-generated)",
+            )
+            remove_disabled = len(ticket["players"]) <= 1
+            if head_col3.button(
+                "Remove",
+                key=f"rm_player_{ticket['_uid']}_{player['_uid']}",
+                disabled=remove_disabled,
+            ):
+                to_remove.append(player_idx)
+
+            _render_player_attributes_form(ticket, player, attribute_defs)
+            _render_player_latency(ticket, player)
+
+    if to_remove:
+        for idx in sorted(to_remove, reverse=True):
+            ticket["players"].pop(idx)
+        st.rerun()
+
+
+def _render_player_attributes_form(
+    ticket: dict, player: dict, attribute_defs: list[dict]
+) -> None:
+    if not attribute_defs:
+        st.caption("No player attributes declared in the ruleset.")
+        return
+
+    st.caption("Attributes")
+    for attr_def in attribute_defs:
+        name = attr_def.get("name", "")
+        attr_type = attr_def.get("type", "")
+        key = f"attr_{ticket['_uid']}_{player['_uid']}_{name}"
+        current = player["attributes"].get(name, _form_default_for_attribute(attr_def))
+        label = f"{name} ({attr_type})"
+
+        if attr_type == "number":
+            player["attributes"][name] = st.number_input(
+                label, value=float(current), key=key, format="%.4f"
+            )
+        elif attr_type == "string":
+            player["attributes"][name] = st.text_input(label, value=str(current), key=key)
+        elif attr_type == "string_list":
+            player["attributes"][name] = st.text_input(
+                f"{label} — comma-separated", value=str(current), key=key
+            )
+        elif attr_type == "string_number_map":
+            player["attributes"][name] = st.text_area(
+                f"{label} — JSON object", value=str(current), key=key, height=100
+            )
+        else:
+            st.caption(f"Unsupported attribute type: {attr_type} ({name})")
+
+
+def _render_player_latency(ticket: dict, player: dict) -> None:
+    st.caption("Latency")
+    rows: list[dict] = player["latency"]
+    to_remove: list[int] = []
+    for row in rows:
+        if "_uid" not in row:
+            row["_uid"] = uuid.uuid4().hex
+
+    for row_idx, row in enumerate(rows):
         col_region, col_ms, col_del = st.columns([3, 2, 1])
         row["region"] = col_region.text_input(
             "Region",
             value=row.get("region", ""),
-            key=f"latency_region_{index}",
+            key=f"lat_r_{ticket['_uid']}_{player['_uid']}_{row['_uid']}",
             label_visibility="collapsed",
             placeholder="eu-west-1",
         )
         row["ms"] = col_ms.number_input(
-            "Latency (ms)",
+            "ms",
             value=int(row.get("ms", 50)),
             min_value=0,
             max_value=5000,
             step=1,
-            key=f"latency_ms_{index}",
+            key=f"lat_ms_{ticket['_uid']}_{player['_uid']}_{row['_uid']}",
             label_visibility="collapsed",
         )
-        if col_del.button("Remove", key=f"latency_del_{index}"):
-            to_remove.append(index)
+        if col_del.button(
+            "Remove",
+            key=f"lat_del_{ticket['_uid']}_{player['_uid']}_{row['_uid']}",
+        ):
+            to_remove.append(row_idx)
 
-    for index in sorted(to_remove, reverse=True):
-        rows.pop(index)
+    if to_remove:
+        for idx in sorted(to_remove, reverse=True):
+            rows.pop(idx)
+        st.rerun()
 
-    if st.button("Add latency row"):
-        rows.append({"region": "", "ms": 50})
+    if st.button(
+        "Add latency row",
+        key=f"lat_add_{ticket['_uid']}_{player['_uid']}",
+    ):
+        rows.append({"_uid": uuid.uuid4().hex, "region": "", "ms": 50})
         st.rerun()
 
 
 def _start_matchmaking_batch(
-    num_players: int,
+    ticket_drafts: list[dict],
     attribute_defs: list[dict],
-    attribute_values: dict[str, Any],
     aws_config: dict,
 ) -> None:
     profile = aws_config["profile"]
@@ -485,55 +590,74 @@ def _start_matchmaking_batch(
     if not config_name:
         st.error("Configuration name is required")
         return
-
-    # Build PlayerAttributes payload once (same for all players)
-    try:
-        player_attributes_payload: dict[str, dict] = {}
-        for attr_def in attribute_defs:
-            attr_name = attr_def.get("name", "")
-            raw_value = attribute_values.get(attr_name)
-            entry = build_player_attribute_payload(attr_def, raw_value)
-            if entry is not None:
-                player_attributes_payload[attr_name] = entry
-    except (ValueError, json.JSONDecodeError) as exc:
-        st.error(f"Invalid attribute value: {exc}")
+    if not ticket_drafts:
+        st.error("No tickets to start")
         return
-
-    latency_map: dict[str, int] = {}
-    for row in st.session_state["latency_rows"]:
-        region_name = (row.get("region") or "").strip()
-        if region_name:
-            latency_map[region_name] = int(row.get("ms", 0))
 
     created: list[str] = []
     failed: list[str] = []
 
     progress = st.progress(0.0, text="Starting tickets...")
-    for i in range(num_players):
-        short_uuid = uuid.uuid4().hex[:8]
-        player_id = f"test-player-{i + 1}-{short_uuid}"
-        player_entry: dict[str, Any] = {
-            "PlayerId": player_id,
-            "PlayerAttributes": player_attributes_payload,
-        }
-        if latency_map:
-            player_entry["LatencyInMs"] = latency_map
+    total = len(ticket_drafts)
+    for t_idx, ticket in enumerate(ticket_drafts):
+        try:
+            players_payload = _build_ticket_players_payload(
+                ticket, attribute_defs, t_idx
+            )
+        except (ValueError, json.JSONDecodeError) as exc:
+            failed.append(f"Ticket {t_idx + 1}: invalid attribute value: {exc}")
+            progress.progress((t_idx + 1) / total)
+            continue
 
         try:
-            ticket_id = start_ticket(profile, region, config_name, [player_entry])
+            ticket_id = start_ticket(profile, region, config_name, players_payload)
             created.append(ticket_id)
         except (ClientError, BotoCoreError) as exc:
-            failed.append(f"{player_id}: {exc}")
+            failed.append(f"Ticket {t_idx + 1}: {exc}")
 
-        progress.progress((i + 1) / num_players, text=f"Started {i + 1}/{num_players}")
+        progress.progress((t_idx + 1) / total, text=f"Started {t_idx + 1}/{total}")
 
     progress.empty()
-
     if created:
         st.session_state["active_tickets"].extend(created)
         st.success(f"Created {len(created)} ticket(s)")
     if failed:
         st.error("Failed to start some tickets:\n" + "\n".join(failed))
+
+
+def _build_ticket_players_payload(
+    ticket: dict, attribute_defs: list[dict], ticket_idx: int
+) -> list[dict]:
+    payload: list[dict] = []
+    for p_idx, player in enumerate(ticket["players"]):
+        player_id = (player.get("player_id") or "").strip()
+        if not player_id:
+            player_id = (
+                f"test-player-{ticket_idx + 1}-{p_idx + 1}-{uuid.uuid4().hex[:8]}"
+            )
+
+        attributes_payload: dict[str, dict] = {}
+        for attr_def in attribute_defs:
+            name = attr_def.get("name", "")
+            raw_value = player["attributes"].get(name)
+            entry = build_player_attribute_payload(attr_def, raw_value)
+            if entry is not None:
+                attributes_payload[name] = entry
+
+        latency_map: dict[str, int] = {}
+        for row in player["latency"]:
+            region_name = (row.get("region") or "").strip()
+            if region_name:
+                latency_map[region_name] = int(row.get("ms", 0))
+
+        player_entry: dict[str, Any] = {
+            "PlayerId": player_id,
+            "PlayerAttributes": attributes_payload,
+        }
+        if latency_map:
+            player_entry["LatencyInMs"] = latency_map
+        payload.append(player_entry)
+    return payload
 
 
 def render_monitor_tickets() -> None:
